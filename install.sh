@@ -6,7 +6,6 @@ if [[ $EUID -eq 0 ]]; then
     exit 1
 fi
 
-
 # --- Sudo password prompt (kjøres før alt annet) ---
 read -s -p "[sudo] password for $USER: " password
 echo
@@ -58,7 +57,6 @@ install_sudoers_rules() {
     echo -e "$INFO Legger til sudoers-regler for smartctl, mdadm, lspci, nvme og systemkontroll..."
 
     SUDOERS_FILE="/etc/sudoers.d/sysinfo"
-
     CURRENT_USER="$USER"
 
     RULES=$(cat <<EOF
@@ -81,13 +79,9 @@ $CURRENT_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl reboot --firmware-setup
 EOF
 )
 
-    # Skriv filen
     echo "$password" | sudo -S tee "$SUDOERS_FILE" >/dev/null <<< "$RULES"
-
-    # Sett riktige permissions
     echo "$password" | sudo -S chmod 440 "$SUDOERS_FILE"
 
-    # Valider syntaks
     if echo "$password" | sudo -S visudo -cf "$SUDOERS_FILE" >/dev/null 2>&1; then
         echo -e "   $CHECK sudoers-regler lagt til og validert."
     else
@@ -97,17 +91,16 @@ EOF
     fi
 }
 
-
 # --- Funksjon: last ned scripts og config ---
 install_files() {
     echo -e "$INFO Laster ned neofetch config og scripts..."
 
-    # Neofetch config
     NEO_DIR="/etc/neofetch"
     NEO_CONF="$NEO_DIR/config.conf"
     echo "$password" | sudo -S mkdir -p "$NEO_DIR"
 
-    if [[ -f "$NEO_CONF" ]]; then
+    # --- FIX: Backup kun hvis original finnes og backup ikke finnes ---
+    if [[ -f "$NEO_CONF" && ! -f "$NEO_CONF.bak" ]]; then
         echo "$password" | sudo -S mv "$NEO_CONF" "$NEO_CONF.bak"
         echo -e "   $WARN Backup av eksisterende neofetch config"
     fi
@@ -146,12 +139,12 @@ install_files() {
     echo "$password" | sudo -S chmod +x /usr/local/bin/whichdisk
     echo -e "   $CHECK whichdisk installert"
 
+    # diskhealth
     echo "$password" | sudo -S curl -fsSL \
         https://raw.githubusercontent.com/bskjon/linux-system-defaults/refs/heads/master/scripts/diskhealth.sh \
         -o /usr/local/bin/diskhealth
     echo "$password" | sudo -S chmod +x /usr/local/bin/diskhealth
-    echo -e "   $CHECK diskhealth installert"    
-
+    echo -e "   $CHECK diskhealth installert"
 }
 
 # --- Funksjon: opprett MOTD pipeline ---
@@ -160,21 +153,18 @@ install_motd() {
 
     MOTD_DIR="/etc/update-motd.d"
 
-    # Neofetch
     echo "$password" | sudo -S tee "$MOTD_DIR/01-neofetch" >/dev/null <<'EOF'
 #!/bin/bash
 /usr/bin/neofetch --config /etc/neofetch/config.conf
 EOF
     echo "$password" | sudo -S chmod +x "$MOTD_DIR/01-neofetch"
 
-    # HDD temp
     echo "$password" | sudo -S tee "$MOTD_DIR/02-hddtemp" >/dev/null <<'EOF'
 #!/bin/bash
 /usr/local/bin/hddtemp.sh
 EOF
     echo "$password" | sudo -S chmod +x "$MOTD_DIR/02-hddtemp"
 
-    # NVMe temp
     echo "$password" | sudo -S tee "$MOTD_DIR/03-nvmetemp" >/dev/null <<'EOF'
 #!/bin/bash
 /usr/local/bin/nvmetemp.sh
