@@ -1,13 +1,15 @@
 #!/bin/bash
 
 # ============================================================
-#   diskinfo v4.6 – RAW \033 for neofetch + --print for colors
+#   diskinfo v5.0 – RAID + BCACHE:Mode + downgraded NVMe
+#   RAW \033 for neofetch, --print for real colors
 # ============================================================
 
 set -o pipefail
 
 CACHE="/dev/shm/diskinfo.cache"
 HIST="/var/lib/diskinfo/history.db"
+LOCK="/var/lib/diskinfo/history.lock"
 WINDOW_SIZE=5
 
 READ_ONLY=0
@@ -73,8 +75,18 @@ trend_eval() {
     [[ -z "$csv" ]] && { echo "stable"; return; }
 
     IFS=',' read -ra arr <<< "$csv"
+    local len=${#arr[@]}
+    if (( len == 0 )); then
+        echo "stable"
+        return
+    fi
+
     local first="${arr[0]}"
-    local last="${arr[-1]}"
+    local last="${arr[$((len-1))]}"
+
+    [[ "$first" =~ ^[0-9]+$ ]] || first=0
+    [[ "$last"  =~ ^[0-9]+$ ]] || last=0
+
     local delta=$((last - first))
 
     if (( delta >= 5 )); then echo "imminent"; return; fi
@@ -85,9 +97,14 @@ trend_eval() {
 }
 
 # -------------------------
-# Load history
+# Load history (with lock)
 # -------------------------
 declare -A HISTMAP
+
+if (( READ_ONLY == 0 )); then
+    exec 9>"$LOCK"
+    flock -x 9
+fi
 
 if [[ -f "$HIST" ]]; then
     while read -r serial rest; do
@@ -104,13 +121,15 @@ get_sata_speed() {
   local out
   out=$(sudo -n smartctl -i "$1" 2>/dev/null)
 
-  local cur=$(echo "$out" | grep -o "current: [0-9.]\+ Gb/s")
+  local cur
+  cur=$(echo "$out" | grep -o "current: [0-9.]\+ Gb/s")
   if [[ -n "$cur" ]]; then
     echo "@${cur#current: }"
     return
   fi
 
-  local ver=$(echo "$out" | grep -o "[0-9.]\+ Gb/s")
+  local ver
+  ver=$(echo "$out" | grep -o "[0-9.]\+ Gb/s")
   if [[ -n "$ver" ]]; then
     echo "@$ver"
     return
@@ -132,13 +151,12 @@ get_nvme_speed() {
 
   local line
   line=$(sudo -n lspci -s "$pci_addr" -vv 2>/dev/null |
-    grep -o "Speed [0-9.]*GT/s, Width x[0-9]" |
-    head -n1)
+    grep -i "LnkSta" |
+    grep -o "Speed [0-9.]*GT/s[^,]*, Width x[0-9]")
 
   if [[ -n "$line" ]]; then
-    local out="@$(echo "$line" | sed -E 's/Speed ([0-9.]+)GT\/s, Width x([0-9])/\1 GT\/s, Width x\2/')"
-    out="${out//$'\n'/}"
-    out="${out//$'\r'/}"
+    local out="@$(echo "$line" |
+      sed -E 's/Speed ([0-9.]+)GT\/s/\1 GT\/s/')"
     echo "$out"
   else
     echo "@N/A"
@@ -162,10 +180,66 @@ is_bcache_member() {
   [[ -d "/sys/block/$1/bcache" ]] && echo "yes" || echo "no"
 }
 
+get_bcache_mode_from_node() {
+  local node="$1"
+  local mode_raw
+  mode_raw=$(cat "/sys/block/$node/bcache/cache_mode" 2>/dev/null) || { echo ""; return; }
+  local first
+  first=$(echo "$mode_raw" | awk '{print $1}')
+  case "$first" in
+    writeback)    echo "Writeback" ;;
+    writethrough) echo "Writethrough" ;;
+    writearound)  echo "Writearound" ;;
+    none)         echo "None" ;;
+    *)            echo "" ;;
+  esac
+}
+
+# Finn bcache-node for gitt disk (backing eller cache)
+get_bcache_node_for_disk() {
+  local disk="$1"
+
+  # Backing: /sys/block/<disk>/bcache -> ../../bcacheX
+  if [[ -e "/sys/block/$disk/bcache" ]]; then
+    local link
+    link=$(readlink -f "/sys/block/$disk/bcache" 2>/dev/null)
+    if [[ -n "$link" ]]; then
+      local base
+      base=$(basename "$link")
+      [[ "$base" =~ ^bcache[0-9]+$ ]] && { echo "$base"; return; }
+    fi
+  fi
+
+  # Cache: /sys/block/bcacheX/bcache/cache* -> /sys/block/<disk>
+  local node
+  for node in /sys/block/bcache*; do
+    [[ -d "$node" ]] || continue
+    local c
+    for c in "$node"/bcache/cache*; do
+      [[ -e "$c" ]] || continue
+      local link
+      link=$(readlink -f "$c" 2>/dev/null) || continue
+      if [[ "$(basename "$link")" == "$disk" ]]; then
+        basename "$node"
+        return
+      fi
+    done
+  done
+}
+
+raid_bcache_node() {
+  local md="$1"
+  local mdname="${md##*/}"
+  lsblk -rno NAME,PKNAME |
+    awk -v p="$mdname" '$2==p && $1 ~ /^bcache/ {print $1; exit}'
+}
+
 get_disk_space() {
   local dev="$1"
 
-  local space=$(df -h --output=source,avail |
+  # First: direct df on the disk itself (GiB, integer)
+  local space
+  space=$(df -BG --output=source,avail 2>/dev/null |
     awk -v d="/dev/$dev" '$1==d {print $2; exit}')
 
   if [[ -n "$space" ]]; then
@@ -173,20 +247,31 @@ get_disk_space() {
     return
   fi
 
-  space=$(lsblk -rno NAME,MOUNTPOINT |
-    awk -v d="$dev" '$1 ~ "^"d"p?[0-9]+$" && $2 != "" {print "/dev/"$1}' |
-    while read -r part; do
-      df -h "$part" | awk -v p="$part" '$1==p {print $4}'
-    done |
-    awk '{sum+=$1} END {printf "%.0fG", sum}')
+  # Sum partitions mounted, using GiB integers
+  local sum=0
+  while read -r part mp; do
+    [[ -z "$mp" ]] && continue
+    local val
+    val=$(df -BG --output=source,avail "$part" 2>/dev/null |
+      awk -v p="$part" '$1==p {print $2; exit}')
+    [[ -z "$val" ]] && continue
+    val=${val%G}
+    [[ "$val" =~ ^[0-9]+$ ]] || val=0
+    sum=$((sum + val))
+  done < <(lsblk -rno NAME,MOUNTPOINT | awk -v d="$dev" '$1 ~ "^"d"p?[0-9]+$" && $2 != "" {print "/dev/"$1, $2}')
 
-  [[ -z "$space" ]] && echo "0G" || echo "$space"
+  if (( sum == 0 )); then
+    echo "0G"
+  else
+    echo "${sum}G"
+  fi
 }
 
 get_md_or_bcache_space() {
   local md="$1"
 
-  local direct=$(df -h --output=source,avail |
+  local direct
+  direct=$(df -BG --output=source,avail 2>/dev/null |
     awk -v m="$md" '$1==m {print $2; exit}')
 
   if [[ -n "$direct" ]]; then
@@ -195,11 +280,12 @@ get_md_or_bcache_space() {
   fi
 
   local mdname="${md##*/}"
-  local bcache=$(lsblk -rno NAME,PKNAME |
+  local bcache
+  bcache=$(lsblk -rno NAME,PKNAME |
     awk -v p="$mdname" '$2==p && $1 ~ /^bcache/ {print $1; exit}')
 
   if [[ -n "$bcache" ]]; then
-    df -h --output=source,avail |
+    df -BG --output=source,avail 2>/dev/null |
       awk -v b="/dev/$bcache" '$1==b {print $2; exit}'
     return
   fi
@@ -213,16 +299,18 @@ get_bcache_stats() {
 
   [[ ! -d "$bpath" ]] && echo "no stats" && return
 
-  local uuid=$(readlink -f "$bpath/set" | awk -F/ '{print $NF}')
+  local uuid
+  uuid=$(readlink -f "$bpath/set" | awk -F/ '{print $NF}')
   local stats="/sys/fs/bcache/$uuid/stats_total"
 
   if [[ -r "$stats/cache_hits" && -r "$stats/cache_misses" ]]; then
-    local hits=$(<"$stats/cache_hits")
-    local misses=$(<"$stats/cache_misses")
-    local total=$((hits + misses))
+    local hits misses total percent
+    hits=$(<"$stats/cache_hits")
+    misses=$(<"$stats/cache_misses")
+    total=$((hits + misses))
 
     if (( total > 0 )); then
-      local percent=$((100 * hits / total))
+      percent=$((100 * hits / total))
       echo "${percent}% hit"
     else
       echo "0% usage"
@@ -242,13 +330,28 @@ fi
 
 declare -A NEW_HIST
 
-lsblk -ndo NAME,TYPE |
-  awk '$2=="disk"{print $1}' |
-  while read -r disk; do
+while read -r disk; do
 
     dev="/dev/$disk"
 
     mapfile -t dh < <(diskhealth --diskinfo "$dev")
+
+    # Safety check: diskhealth must return at least header + metrics
+    if (( ${#dh[@]} < 2 )); then
+        label="Disk $disk"
+        value="\033[1;90mERROR\033[0m, Speed @N/A, Left: — [\033[1;90mUNMOUNTED\033[0m]"
+        if (( READ_ONLY == 0 )); then
+            printf "%s:%s\n" "$label" "$value" >> "$CACHE"
+            (( PRINT_MODE == 1 )) && echo -e "$label: $value"
+        else
+            if (( PRINT_MODE == 1 )); then
+                echo -e "$label: $value"
+            else
+                printf "%s:%s\n" "$label" "$value"
+            fi
+        fi
+        continue
+    fi
 
     header="${dh[0]}"
     metrics="${dh[1]}"
@@ -260,6 +363,8 @@ lsblk -ndo NAME,TYPE |
     model="${model_kv#model=}"
 
     declare realloc pending offline crc hours lcc
+    realloc=0 pending=0 offline=0 crc=0 hours=0 lcc=0
+
     for kv in $metrics; do
         key="${kv%%=*}"
         val="${kv#*=}"
@@ -273,17 +378,29 @@ lsblk -ndo NAME,TYPE |
         esac
     done
 
-    prev="${HISTMAP[$serial]}"
+    # Load previous CSVs safely (no eval, no unsafe splitting)
+    realloc_csv=""
+    pending_csv=""
+    offline_csv=""
+    crc_csv=""
+    hours_csv=""
+    lcc_csv=""
 
+    prev="${HISTMAP[$serial]}"
     if [[ -n "$prev" ]]; then
-        eval "$prev"
-    else
-        realloc_csv=""
-        pending_csv=""
-        offline_csv=""
-        crc_csv=""
-        hours_csv=""
-        lcc_csv=""
+        IFS=' ' read -ra hist_parts <<< "$prev"
+        for kv in "${hist_parts[@]}"; do
+            k="${kv%%=*}"
+            v="${kv#*=}"
+            case "$k" in
+                realloc_csv) realloc_csv="$v" ;;
+                pending_csv) pending_csv="$v" ;;
+                offline_csv) offline_csv="$v" ;;
+                crc_csv)     crc_csv="$v" ;;
+                hours_csv)   hours_csv="$v" ;;
+                lcc_csv)     lcc_csv="$v" ;;
+            esac
+        done
     fi
 
     realloc_csv=$(update_window "$realloc_csv" "$realloc")
@@ -297,6 +414,9 @@ lsblk -ndo NAME,TYPE |
     pending_trend=$(trend_eval "$pending_csv")
     crc_trend=$(trend_eval "$crc_csv")
 
+    # Store updated history
+    NEW_HIST["$serial"]="realloc_csv=$realloc_csv pending_csv=$pending_csv offline_csv=$offline_csv crc_csv=$crc_csv hours_csv=$hours_csv lcc_csv=$lcc_csv"
+
     tag_list=()
     left=""
 
@@ -304,12 +424,36 @@ lsblk -ndo NAME,TYPE |
     if [[ -n "$md_dev" ]]; then
       left=$(get_md_or_bcache_space "$md_dev")
       tag_list+=("RAID")
+
+      rbnode=$(raid_bcache_node "$md_dev")
+      if [[ -n "$rbnode" ]]; then
+        mode=$(get_bcache_mode_from_node "$rbnode")
+        [[ -n "$mode" ]] && tag_list+=("BCACHE:$mode")
+      fi
     fi
 
+    # BCACHE – per-device node resolution with fallback
     if [[ $(is_bcache_member "$disk") == "yes" ]]; then
-      tag_list+=("BCACHE")
       usage=$(get_bcache_stats "$disk")
       left="$usage (cache)"
+
+      node=$(get_bcache_node_for_disk "$disk")
+      if [[ -z "$node" ]]; then
+          for n in /sys/block/bcache*; do
+              [[ -d "$n" ]] || continue
+              node="${n##*/}"
+              break
+          done
+      fi
+
+      mode=""
+      [[ -n "$node" ]] && mode=$(get_bcache_mode_from_node "$node")
+
+      if [[ -n "$mode" ]]; then
+          tag_list+=("BCACHE:$mode")
+      else
+          tag_list+=("BCACHE")
+      fi
     fi
 
     if [[ -z "$left" ]]; then
@@ -328,11 +472,12 @@ lsblk -ndo NAME,TYPE |
 
     for t in "${tag_list[@]}"; do
       case "$t" in
-        RAID)       colored_tags+=("\033[1;35mRAID\033[0m") ;;
-        BCACHE)     colored_tags+=("\033[1;36mBCACHE\033[0m") ;;
-        ACTIVE)     colored_tags+=("\033[1;32mACTIVE\033[0m") ;;
-        UNMOUNTED)  colored_tags+=("\033[1;90mUNMOUNTED\033[0m") ;;
-        *)          colored_tags+=("$t") ;;
+        RAID)                 colored_tags+=("\033[1;35mRAID\033[0m") ;;
+        ACTIVE)               colored_tags+=("\033[1;32mACTIVE\033[0m") ;;
+        UNMOUNTED)            colored_tags+=("\033[1;90mUNMOUNTED\033[0m") ;;
+        BCACHE:*)             colored_tags+=("\033[1;36m${t}\033[0m") ;;
+        BCACHE)               colored_tags+=("\033[1;36mBCACHE\033[0m") ;;
+        *)                    colored_tags+=("$t") ;;
       esac
     done
 
@@ -362,19 +507,12 @@ lsblk -ndo NAME,TYPE |
     label="Disk $disk"
     value="${health_color}${health}${reset_color}, Speed $speed, Left: $left [$tags]"
 
-    # -------------------------
-    # OUTPUT LOGIC
-    # -------------------------
     if (( READ_ONLY == 0 )); then
-        # Always write RAW \033 to cache
         printf "%s:%s\n" "$label" "$value" >> "$CACHE"
-
-        # Print to terminal only if --print
         if (( PRINT_MODE == 1 )); then
             echo -e "$label: $value"
         fi
     else
-        # read-only always prints to terminal
         if (( PRINT_MODE == 1 )); then
             echo -e "$label: $value"
         else
@@ -382,11 +520,12 @@ lsblk -ndo NAME,TYPE |
         fi
     fi
 
-done
+done < <(lsblk -ndo NAME,TYPE | awk '$2=="disk"{print $1}')
 
 if (( READ_ONLY == 0 )); then
     > "$HIST"
     for serial in "${!NEW_HIST[@]}"; do
         echo "$serial ${NEW_HIST[$serial]}" >> "$HIST"
     done
+    flock -u 9
 fi
