@@ -423,7 +423,13 @@ while read -r disk; do
     md_dev=$(find_md_for_disk "$disk")
     if [[ -n "$md_dev" ]]; then
       left=$(get_md_or_bcache_space "$md_dev")
-      tag_list+=("RAID")
+
+      md_name="${md_dev##*/}"                     # md2
+      md_upper=$(echo "$md_name" | tr '[:lower:]' '[:upper:]')   # MD2
+
+      # RAID blir lilla via farge-switchen (matcher RAID:*)
+      # : blir hvit, MD2 blir grå
+      tag_list+=("RAID\033[1;37m:\033[0m\033[1;90m${md_upper}\033[0m")
 
       rbnode=$(raid_bcache_node "$md_dev")
       if [[ -n "$rbnode" ]]; then
@@ -431,6 +437,7 @@ while read -r disk; do
         [[ -n "$mode" ]] && tag_list+=("BCACHE:$mode")
       fi
     fi
+
 
     # BCACHE – per-device node resolution with fallback
     if [[ $(is_bcache_member "$disk") == "yes" ]]; then
@@ -472,7 +479,7 @@ while read -r disk; do
 
     for t in "${tag_list[@]}"; do
       case "$t" in
-        RAID)                 colored_tags+=("\033[1;35mRAID\033[0m") ;;
+        RAID*)                colored_tags+=("\033[1;35mRAID\033[0m${t#RAID}") ;;
         ACTIVE)               colored_tags+=("\033[1;32mACTIVE\033[0m") ;;
         UNMOUNTED)            colored_tags+=("\033[1;90mUNMOUNTED\033[0m") ;;
         BCACHE:*)             colored_tags+=("\033[1;36m${t}\033[0m") ;;
@@ -481,7 +488,9 @@ while read -r disk; do
       esac
     done
 
-    tags=$(IFS=" "; echo "${colored_tags[*]}")
+    tags=$(IFS="+"; echo "${colored_tags[*]}") 
+    tags="${tags//+/" + "}"
+
 
     if [[ "$disk" == nvme* ]]; then
       speed=$(get_nvme_speed "$disk")

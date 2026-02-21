@@ -28,7 +28,7 @@ install_deps() {
     echo "$password" | sudo -S apt update -y >/dev/null
 
     echo -e "$INFO Installerer nødvendige pakker..."
-    REQUIRED_PACKAGES=(neofetch smartmontools pciutils mdadm nvme-cli curl)
+    REQUIRED_PACKAGES=(neofetch smartmontools pciutils mdadm nvme-cli curl jq)
 
     INSTALLED=()
     SKIPPED=()
@@ -63,12 +63,16 @@ install_sudoers_rules() {
 
     RULES=$(cat <<EOF
 # Diskinfo / systeminfo
-ALL ALL=NOPASSWD: /usr/sbin/smartctl -H *, /usr/sbin/smartctl -i *, /usr/sbin/smartctl -A *
+ALL ALL=NOPASSWD: \
+    /usr/sbin/smartctl -H *, \
+    /usr/sbin/smartctl -i *, \
+    /usr/sbin/smartctl -A *, \
+    /usr/sbin/smartctl -x *
+
 ALL ALL=NOPASSWD: /sbin/mdadm --detail *
 ALL ALL=NOPASSWD: /usr/bin/lspci -s * -vv
 
 # Telegraf sensorer
-telegraf ALL=(ALL) NOPASSWD: /usr/sbin/smartctl
 telegraf ALL=(ALL) NOPASSWD: /usr/sbin/nvme
 
 # Bruker-spesifikke kommandoer
@@ -134,6 +138,20 @@ install_files() {
         -o /usr/local/bin/nvmetemp.sh
     echo "$password" | sudo -S chmod +x /usr/local/bin/nvmetemp.sh
     echo -e "   $CHECK nvmetemp.sh installert"
+
+    # whichdisk utility
+    echo "$password" | sudo -S curl -fsSL \
+        https://raw.githubusercontent.com/bskjon/linux-system-defaults/refs/heads/master/scripts/whichdisk.sh \
+        -o /usr/local/bin/whichdisk
+    echo "$password" | sudo -S chmod +x /usr/local/bin/whichdisk
+    echo -e "   $CHECK whichdisk installert"
+
+    echo "$password" | sudo -S curl -fsSL \
+        https://raw.githubusercontent.com/bskjon/linux-system-defaults/refs/heads/master/scripts/diskhealth.sh \
+        -o /usr/local/bin/diskhealth
+    echo "$password" | sudo -S chmod +x /usr/local/bin/diskhealth
+    echo -e "   $CHECK diskhealth installert"    
+
 }
 
 # --- Funksjon: opprett MOTD pipeline ---
