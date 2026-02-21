@@ -1,27 +1,39 @@
 #!/bin/bash
 
 # ============================================================
-#   Diskinfo v3 – systemd compatible
-#
-#   Trend + Sample Window + RAID/BCACHE/Speed/Space/Tags
-#   Health from diskhealth (single source of truth)
-#   History stored in /var/lib/diskinfo/history.db
-#   --read-only = no writes (cache OR history)
+#   diskinfo v4.6 – RAW \033 for neofetch + --print for colors
 # ============================================================
+
+set -o pipefail
 
 CACHE="/dev/shm/diskinfo.cache"
 HIST="/var/lib/diskinfo/history.db"
 WINDOW_SIZE=5
 
-mkdir -p /var/lib/diskinfo
+READ_ONLY=0
+PRINT_MODE=0
 
 # -------------------------
-# Flags
+# Arg parsing
 # -------------------------
-READ_ONLY=0
-if [[ "$1" == "--read-only" ]]; then
-    READ_ONLY=1
-    shift
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --read-only)
+            READ_ONLY=1
+            shift
+            ;;
+        --print)
+            PRINT_MODE=1
+            shift
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+if (( READ_ONLY == 0 )); then
+    mkdir -p /var/lib/diskinfo
 fi
 
 # -------------------------
@@ -58,8 +70,9 @@ update_window() {
 # -------------------------
 trend_eval() {
     local csv="$1"
-    IFS=',' read -ra arr <<< "$csv"
+    [[ -z "$csv" ]] && { echo "stable"; return; }
 
+    IFS=',' read -ra arr <<< "$csv"
     local first="${arr[0]}"
     local last="${arr[-1]}"
     local delta=$((last - first))
@@ -72,7 +85,7 @@ trend_eval() {
 }
 
 # -------------------------
-# Load previous history (READ-ONLY still loads)
+# Load history
 # -------------------------
 declare -A HISTMAP
 
@@ -84,12 +97,26 @@ if [[ -f "$HIST" ]]; then
 fi
 
 # -------------------------
-# Helpers (unchanged)
+# Helpers
 # -------------------------
+
 get_sata_speed() {
-  sudo -n smartctl -i "$1" 2>/dev/null |
-    grep -o "current: [0-9.]\+ Gb/s" |
-    awk '{print "@" $2 " " $3}' || echo "@N/A"
+  local out
+  out=$(sudo -n smartctl -i "$1" 2>/dev/null)
+
+  local cur=$(echo "$out" | grep -o "current: [0-9.]\+ Gb/s")
+  if [[ -n "$cur" ]]; then
+    echo "@${cur#current: }"
+    return
+  fi
+
+  local ver=$(echo "$out" | grep -o "[0-9.]\+ Gb/s")
+  if [[ -n "$ver" ]]; then
+    echo "@$ver"
+    return
+  fi
+
+  echo "@N/A"
 }
 
 get_nvme_speed() {
@@ -103,11 +130,19 @@ get_nvme_speed() {
 
   [[ -z "$pci_addr" ]] && echo "@N/A" && return
 
-  sudo -n lspci -s "$pci_addr" -vv 2>/dev/null |
-    grep -i "LnkSta" |
-    grep -o "Speed [0-9.]*GT/s.*Width x[0-9]" |
-    sed -E 's/Speed ([0-9.]+)GT\/s/@\1 GT\/s/' ||
+  local line
+  line=$(sudo -n lspci -s "$pci_addr" -vv 2>/dev/null |
+    grep -o "Speed [0-9.]*GT/s, Width x[0-9]" |
+    head -n1)
+
+  if [[ -n "$line" ]]; then
+    local out="@$(echo "$line" | sed -E 's/Speed ([0-9.]+)GT\/s, Width x([0-9])/\1 GT\/s, Width x\2/')"
+    out="${out//$'\n'/}"
+    out="${out//$'\r'/}"
+    echo "$out"
+  else
     echo "@N/A"
+  fi
 }
 
 find_md_for_disk() {
@@ -213,29 +248,31 @@ lsblk -ndo NAME,TYPE |
 
     dev="/dev/$disk"
 
-    # --------------------------------------------------------
-    # 1. HEALTH + METRICS from diskhealth
-    # --------------------------------------------------------
     mapfile -t dh < <(diskhealth --diskinfo "$dev")
 
     header="${dh[0]}"
     metrics="${dh[1]}"
 
-    health=$(echo "$header" | awk -F'|' '{print $3}' | xargs)
+    IFS="|" read name type health serial_kv model_kv <<< "$header"
+    health="$(echo "$health" | xargs)"
 
-    eval "$metrics"
+    serial="${serial_kv#serial=}"
+    model="${model_kv#model=}"
 
-    # --------------------------------------------------------
-    # 2. SERIAL (for history)
-    # --------------------------------------------------------
-    serial=$(sudo -n smartctl -i "$dev" |
-             awk -F: '/Serial Number/ {print $2}' | xargs)
+    declare realloc pending offline crc hours lcc
+    for kv in $metrics; do
+        key="${kv%%=*}"
+        val="${kv#*=}"
+        case "$key" in
+            realloc) realloc="$val" ;;
+            pending) pending="$val" ;;
+            offline) offline="$val" ;;
+            crc)     crc="$val" ;;
+            hours)   hours="$val" ;;
+            lcc)     lcc="$val" ;;
+        esac
+    done
 
-    [[ -z "$serial" ]] && continue
-
-    # --------------------------------------------------------
-    # 3. Load previous window
-    # --------------------------------------------------------
     prev="${HISTMAP[$serial]}"
 
     if [[ -n "$prev" ]]; then
@@ -249,9 +286,6 @@ lsblk -ndo NAME,TYPE |
         lcc_csv=""
     fi
 
-    # --------------------------------------------------------
-    # 4. Update windows
-    # --------------------------------------------------------
     realloc_csv=$(update_window "$realloc_csv" "$realloc")
     pending_csv=$(update_window "$pending_csv" "$pending")
     offline_csv=$(update_window "$offline_csv" "$offline")
@@ -259,16 +293,10 @@ lsblk -ndo NAME,TYPE |
     hours_csv=$(update_window "$hours_csv" "$hours")
     lcc_csv=$(update_window "$lcc_csv" "$lcc")
 
-    # --------------------------------------------------------
-    # 5. Trend evaluation
-    # --------------------------------------------------------
     realloc_trend=$(trend_eval "$realloc_csv")
     pending_trend=$(trend_eval "$pending_csv")
     crc_trend=$(trend_eval "$crc_csv")
 
-    # --------------------------------------------------------
-    # 6. RAID / BCACHE / SPACE / SPEED
-    # --------------------------------------------------------
     tag_list=()
     left=""
 
@@ -296,58 +324,66 @@ lsblk -ndo NAME,TYPE |
       fi
     fi
 
-    tags=$(IFS=" "; echo "${tag_list[*]}")
+    colored_tags=()
 
-    # SPEED
+    for t in "${tag_list[@]}"; do
+      case "$t" in
+        RAID)       colored_tags+=("\033[1;35mRAID\033[0m") ;;
+        BCACHE)     colored_tags+=("\033[1;36mBCACHE\033[0m") ;;
+        ACTIVE)     colored_tags+=("\033[1;32mACTIVE\033[0m") ;;
+        UNMOUNTED)  colored_tags+=("\033[1;90mUNMOUNTED\033[0m") ;;
+        *)          colored_tags+=("$t") ;;
+      esac
+    done
+
+    tags=$(IFS=" "; echo "${colored_tags[*]}")
+
     if [[ "$disk" == nvme* ]]; then
       speed=$(get_nvme_speed "$disk")
     else
       speed=$(get_sata_speed "$dev")
     fi
 
-    # --------------------------------------------------------
-    # 7. Save new history (ONLY if not read-only)
-    # --------------------------------------------------------
-    if (( READ_ONLY == 0 )); then
-        NEW_HIST["$serial"]="realloc_csv=\"$realloc_csv\" pending_csv=\"$pending_csv\" offline_csv=\"$offline_csv\" crc_csv=\"$crc_csv\" hours_csv=\"$hours_csv\" lcc_csv=\"$lcc_csv\""
-    fi
-
-    # --------------------------------------------------------
-    # 8. COLORING
-    # --------------------------------------------------------
-    [[ "$tags" == *RAID* ]] && tags="\033[1;35m$tags\033[0m"
-    [[ "$tags" == *BCACHE* ]] && tags="\033[1;36m$tags\033[0m"
-    [[ "$tags" == *UNMOUNTED* ]] && tags="\033[1;90m$tags\033[0m"
+    speed="${speed//$'\n'/}"
+    speed="${speed//$'\r'/}"
 
     case "$health" in
-      HEALTHY) health_color="\033[1;32m" ;;
-      ACCEPTABLE) health_color="\033[1;33m" ;;
-      DEGRADED) health_color="\033[1;35m" ;;
-      FAILING) health_color="\033[1;31m" ;;
+      HEALTHY)            health_color="\033[1;32m" ;;
+      ACCEPTABLE)         health_color="\033[0;92m" ;;
+      DEGRADED)           health_color="\033[1;33m" ;;
+      FAILING)            health_color="\033[1;31m" ;;
       "IMMINENT FAILURE") health_color="\033[1;41m" ;;
-      ERROR) health_color="\033[1;90m" ;;
-      *) health_color="\033[1;90m" ;;
+      ERROR)              health_color="\033[1;90m" ;;
+      *)                  health_color="\033[1;90m" ;;
     esac
 
     reset_color="\033[0m"
 
-    # --------------------------------------------------------
-    # 9. OUTPUT
-    # --------------------------------------------------------
     label="Disk $disk"
     value="${health_color}${health}${reset_color}, Speed $speed, Left: $left [$tags]"
 
+    # -------------------------
+    # OUTPUT LOGIC
+    # -------------------------
     if (( READ_ONLY == 0 )); then
-        echo -e "$label:$value" >> "$CACHE"
+        # Always write RAW \033 to cache
+        printf "%s:%s\n" "$label" "$value" >> "$CACHE"
+
+        # Print to terminal only if --print
+        if (( PRINT_MODE == 1 )); then
+            echo -e "$label: $value"
+        fi
     else
-        echo -e "$label:$value"
+        # read-only always prints to terminal
+        if (( PRINT_MODE == 1 )); then
+            echo -e "$label: $value"
+        else
+            printf "%s:%s\n" "$label" "$value"
+        fi
     fi
 
 done
 
-# ------------------------------------------------------------
-#  Write updated history (ONLY if not read-only)
-# ------------------------------------------------------------
 if (( READ_ONLY == 0 )); then
     > "$HIST"
     for serial in "${!NEW_HIST[@]}"; do
