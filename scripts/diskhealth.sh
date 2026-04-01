@@ -296,41 +296,33 @@ format_json() {
 format_influx() {
     local dev="$1" type="$2" status="$3" reason="$4" metrics="$5" serial="$6" model="$7"
 
-    # Gjør tag-verdier Influx-sikre (ingen mellomrom)
-    dev="${dev// /_}"
-    type="${type// /_}"
-    status="${status// /_}"
-    reason="${reason// /_}"
-    serial="${serial// /_}"
-    model="${model// /_}"
+    # Safe tag-verdier (ingen mellomrom)
+    local tag_dev="${dev// /_}"
+    local tag_type="${type// /_}"
+    local tag_status="${status// /_}"
+    local tag_reason="${reason// /_}"
+    local tag_serial="${serial// /_}"
+    local tag_model="${model// /_}"
 
     # Measurement + tags
     printf 'diskhealth,device=%s,type=%s,status=%s,reason=%s,serial=%s,model=%s ' \
+        "$tag_dev" "$tag_type" "$tag_status" "$tag_reason" "$tag_serial" "$tag_model"
+
+    # Fields: samme navn som tags, men med original tekst
+    printf 'device="%s",type="%s",status="%s",reason="%s",serial="%s",model="%s"' \
         "$dev" "$type" "$status" "$reason" "$serial" "$model"
 
-    # Fields
-    local first=1
+    # Metrics som fields
     for kv in $metrics; do
         key="${kv%%=*}"
         val="${kv#*=}"
-
         [[ -z "$key" ]] && continue
-
-        if [[ $first -eq 1 ]]; then
-            first=0
-        else
-            printf ','
-        fi
-
-        if [[ "$val" =~ ^[0-9]+$ ]]; then
-            printf '%s=%si' "$key" "$val"
-        else
-            printf '%s="%s"' "$key" "$val"
-        fi
+        printf ',%s=%si' "$key" "$val"
     done
 
     printf '\n'
 }
+
 
 
 
