@@ -47,6 +47,10 @@ while [[ $# -gt 0 ]]; do
             FORMAT="json"
             shift
             ;;
+        --telegraf)
+            FORMAT="telegraf"
+            shift
+            ;;            
         --diskinfo)
             FORMAT="diskinfo"
             shift
