@@ -47,8 +47,8 @@ while [[ $# -gt 0 ]]; do
             FORMAT="json"
             shift
             ;;
-        --telegraf)
-            FORMAT="telegraf"
+        --influx)
+            FORMAT="influx"
             shift
             ;;            
         --diskinfo)
@@ -293,10 +293,18 @@ format_json() {
 }
 
 
-format_telegraf() {
+format_influx() {
     local dev="$1" type="$2" status="$3" reason="$4" metrics="$5" serial="$6" model="$7"
 
-    # Start med measurement + tags
+    # Gjør tag-verdier Influx-sikre (ingen mellomrom)
+    dev="${dev// /_}"
+    type="${type// /_}"
+    status="${status// /_}"
+    reason="${reason// /_}"
+    serial="${serial// /_}"
+    model="${model// /_}"
+
+    # Measurement + tags
     printf 'diskhealth,device=%s,type=%s,status=%s,reason=%s,serial=%s,model=%s ' \
         "$dev" "$type" "$status" "$reason" "$serial" "$model"
 
@@ -308,16 +316,14 @@ format_telegraf() {
 
         [[ -z "$key" ]] && continue
 
-        # Komma mellom fields
         if [[ $first -eq 1 ]]; then
             first=0
         else
             printf ','
         fi
 
-        # Tall uten anførselstegn
         if [[ "$val" =~ ^[0-9]+$ ]]; then
-            printf '%s=%s' "$key" "$val"
+            printf '%s=%si' "$key" "$val"
         else
             printf '%s="%s"' "$key" "$val"
         fi
@@ -325,6 +331,7 @@ format_telegraf() {
 
     printf '\n'
 }
+
 
 
 # ============================================================
@@ -339,7 +346,7 @@ for dev in "${TARGET_DEVICES[@]}"; do
     case "$FORMAT" in
         human)    format_human "$dev" "$type" "$status" "$reason" "$metrics" "$serial" "$model" ;;
         json)     JSON_ITEMS+=("$(format_json "$dev" "$type" "$status" "$reason" "$metrics" "$serial" "$model")") ;;
-        telegraf)   format_telegraf "$dev" "$type" "$status" "$reason" "$metrics" "$serial" "$model" ;;
+        influx)   format_influx "$dev" "$type" "$status" "$reason" "$metrics" "$serial" "$model" ;;
         diskinfo) format_diskinfo "$dev" "$type" "$status" "$reason" "$metrics" "$serial" "$model" ;;
         *)        format_human "$dev" "$type" "$status" "$reason" "$metrics" "$serial" "$model" ;;
     esac
