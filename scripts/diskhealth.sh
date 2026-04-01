@@ -296,30 +296,34 @@ format_json() {
 format_telegraf() {
     local dev="$1" type="$2" status="$3" reason="$4" metrics="$5" serial="$6" model="$7"
 
-    printf '{"device":"%s","type":"%s","status":"%s","reason":"%s","serial":"%s","model":"%s","metrics":{' \
+    # Start med measurement + tags
+    printf 'diskhealth,device=%s,type=%s,status=%s,reason=%s,serial=%s,model=%s ' \
         "$dev" "$type" "$status" "$reason" "$serial" "$model"
 
+    # Fields
     local first=1
     for kv in $metrics; do
         key="${kv%%=*}"
         val="${kv#*=}"
+
         [[ -z "$key" ]] && continue
 
+        # Komma mellom fields
         if [[ $first -eq 1 ]]; then
             first=0
         else
             printf ','
         fi
 
-        # numbers stay numbers, strings stay strings
+        # Tall uten anførselstegn
         if [[ "$val" =~ ^[0-9]+$ ]]; then
-            printf '"%s":%s' "$key" "$val"
+            printf '%s=%s' "$key" "$val"
         else
-            printf '"%s":"%s"' "$key" "$val"
+            printf '%s="%s"' "$key" "$val"
         fi
     done
 
-    printf '}}\n'
+    printf '\n'
 }
 
 
