@@ -288,9 +288,41 @@ format_json() {
     echo "}"
 }
 
+
+format_telegraf() {
+    local dev="$1" type="$2" status="$3" reason="$4" metrics="$5" serial="$6" model="$7"
+
+    printf '{"device":"%s","type":"%s","status":"%s","reason":"%s","serial":"%s","model":"%s","metrics":{' \
+        "$dev" "$type" "$status" "$reason" "$serial" "$model"
+
+    local first=1
+    for kv in $metrics; do
+        key="${kv%%=*}"
+        val="${kv#*=}"
+        [[ -z "$key" ]] && continue
+
+        if [[ $first -eq 1 ]]; then
+            first=0
+        else
+            printf ','
+        fi
+
+        # numbers stay numbers, strings stay strings
+        if [[ "$val" =~ ^[0-9]+$ ]]; then
+            printf '"%s":%s' "$key" "$val"
+        else
+            printf '"%s":"%s"' "$key" "$val"
+        fi
+    done
+
+    printf '}}\n'
+}
+
+
 # ============================================================
 #   Main
 # ============================================================
+JSON_ITEMS=()
 for dev in "${TARGET_DEVICES[@]}"; do
     [[ -e "$dev" ]] || continue
 
@@ -298,11 +330,26 @@ for dev in "${TARGET_DEVICES[@]}"; do
 
     case "$FORMAT" in
         human)    format_human "$dev" "$type" "$status" "$reason" "$metrics" "$serial" "$model" ;;
-        json)     format_json "$dev" "$type" "$status" "$reason" "$metrics" "$serial" "$model" ;;
+        json)     JSON_ITEMS+=("$(format_json "$dev" "$type" "$status" "$reason" "$metrics" "$serial" "$model")") ;;
+        telegraf)   format_telegraf "$dev" "$type" "$status" "$reason" "$metrics" "$serial" "$model" ;;
         diskinfo) format_diskinfo "$dev" "$type" "$status" "$reason" "$metrics" "$serial" "$model" ;;
         *)        format_human "$dev" "$type" "$status" "$reason" "$metrics" "$serial" "$model" ;;
     esac
 done
+
+# Output JSON array if json mode
+if [[ "$FORMAT" == "json" ]]; then
+    echo "["
+    for ((i=0; i<${#JSON_ITEMS[@]}; i++)); do
+        echo "  ${JSON_ITEMS[$i]}"
+        if (( i < ${#JSON_ITEMS[@]} - 1 )); then
+            echo "  ,"
+        fi
+    done
+    echo "]"
+    exit 0
+fi
+
 
 # -------------------------
 # Debug footer (human mode only)
